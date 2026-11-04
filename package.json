@@ -1,0 +1,8 @@
+{
+  "name": "assistente-felipe-zapclaw-typebot-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node relay.mjs" },
+  "engines": { "node": ">=20" }
+}
