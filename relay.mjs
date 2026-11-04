@@ -67,6 +67,7 @@ async function answer({ data, account }) {
   }
   if (!reply) {
     reply = await typebot(`typebots/${TYPEBOT_ID}/startChat`, {
+      message: { type: 'text', text: String(data.text.body || '').trim() },
       prefilledVariables: { name: data.contact_name || '', phone: to },
     });
     if (!reply) return;
