@@ -2,6 +2,10 @@
 // WhatsApp Meta Cloud API + ZapClaw + Typebot
 // Relay V3 | Node.js 20+
 
+import { interpretMedia } from './media.mjs';
+import { supportFields, typebotControls } from './controls.mjs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
@@ -16,6 +20,44 @@ const META_VERIFY_TOKEN = env.META_VERIFY_TOKEN || '';
 const META_APP_SECRET = env.META_APP_SECRET || '';
 const META_GRAPH_VERSION = env.META_GRAPH_VERSION || 'v23.0';
 
+const IG_ID = env.INSTAGRAM_ACCOUNT_ID || '';
+const IG_TOKEN = env.INSTAGRAM_ACCESS_TOKEN || '';
+const IG_GRAPH = 'https://graph.instagram.com/' + (env.INSTAGRAM_GRAPH_VERSION || META_GRAPH_VERSION);
+const WA_GRAPH = 'https://graph.facebook.com/' + META_GRAPH_VERSION;
+const IG_TEST_USERS = new Set((env.INSTAGRAM_TEST_USERS || '').split(',').map(x => x.trim()).filter(Boolean));
+const IG_ALLOW_ALL = env.INSTAGRAM_ALLOW_ALL_CONTACTS === 'true';
+const DAY = 86400000;
+const ffmpeg = process.env.OPENAI_API_KEY && spawnSync(env.FFMPEG_PATH || 'ffmpeg', ['-version'], { stdio: 'ignore', timeout: 5000 }).status === 0;
+const PAUSE_MS = bounded(env.HUMAN_PAUSE_MS, 3600000, 1000, 7 * DAY);
+const pauseFile = env.PAUSE_STATE_PATH;
+const pauseSecret = env.CONVERSATION_ADMIN_TOKEN || env.META_APP_SECRET || env.INSTAGRAM_APP_SECRET || env.ZAPCLAW_SECRET;
+if (pauseFile && !pauseSecret) throw new Error('pause_state_requires_secret');
+const pauses = new Map();
+let pauseStorageHealthy = true;
+if (pauseFile) {
+  try {
+    for (const [key, expiry] of JSON.parse(readFileSync(pauseFile, 'utf8'))) {
+      if (expiry === 0 || expiry > Date.now()) pauses.set(key, expiry === 0 ? Infinity : expiry);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error('pause_state_unreadable');
+    savePauses();
+  }
+}
+const botMessages = new Map();
+const instagramSends = new Map();
+const audioHints = new Map();
+const waitingNotifications = new Map();
+
+function bounded(value, fallback, min, max) {
+  const number = Number(value || fallback);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
+}
+
+function log(event, fields = {}) {
+  console.log(JSON.stringify({ event, ...fields }));
+}
+
 const API = env.ZAPCLAW_API_BASE || 'https://api.zapclaw.app/api/v1';
 const API_KEY = env.ZAPCLAW_API_KEY || '';
 const WEBHOOK_SECRET = env.ZAPCLAW_SECRET || '';
@@ -26,10 +68,7 @@ const TYPEBOT_ID = env.TYPEBOT_PUBLIC_ID || 'assistente-felipe-f1w96o8';
 const TEST_PHONE = digits(env.TEST_PHONE);
 const ALLOW_ALL = env.ALLOW_ALL_CONTACTS === 'true';
 
-const DEBOUNCE_MS = Math.min(
-  45000,
-  Math.max(5000, Number(env.DEBOUNCE_MS || 30000))
-);
+const DEBOUNCE_MS = bounded(env.DEBOUNCE_MS, 10000, 5000, 45000);
 
 const SEND_DELAY_MS = Math.min(
   8000,
@@ -43,7 +82,13 @@ const PERSONAL_PHONE = digits(env.PERSONAL_PHONE);
 const HANDOFF_TEST_TO = digits(env.HANDOFF_TEST_TO);
 const NOTIFICATION_DRY_RUN = env.NOTIFICATION_DRY_RUN !== 'false';
 
-const SILENCE_TOKEN = '[[SEM_RESPOSTA]]';
+const destinations = {
+  commercial: digits(env.COMMERCIAL_HANDOFF_PHONE) || CLINIC_PHONE,
+  support: digits(env.SUPPORT_HANDOFF_PHONE) || PERSONAL_PHONE,
+  finance: digits(env.FINANCE_HANDOFF_PHONE),
+};
+const notificationPhones = [...Object.values(destinations), CLINIC_PHONE, PERSONAL_PHONE, HANDOFF_TEST_TO,
+  digits(env.HANDOFF_ALTERNATE_PHONE)].filter(Boolean);
 
 const sessions = new Map();
 const pending = new Map();
@@ -134,10 +179,9 @@ async function typebot(path, payload) {
   );
 
   if (!response.ok) {
+    log('typebot_request_failed', { status: response.status });
     throw new Error(`typebot_${response.status}`);
   }
-
-  console.log('typebot_success');
 
   return response.json();
 }
@@ -150,12 +194,15 @@ function idempotencyKey(id) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-async function sendText(from, to, text, uniqueId) {
+async function sendText(from, to, text, uniqueId, template = '') {
   if (PROVIDER === 'meta') {
     if (!META_ACCESS_TOKEN || !META_PHONE_NUMBER_ID) {
       throw new Error('missing_meta_credentials');
     }
 
+    const content = template
+      ? { type: 'template', template: { name: template, language: { code: env.HANDOFF_TEMPLATE_LANGUAGE || 'pt_BR' } } }
+      : { type: 'text', text: { preview_url: false, body: normalizeText(text).slice(0, 4096) } };
     const response = await fetch(
       `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_PHONE_NUMBER_ID}/messages`,
       {
@@ -168,11 +215,7 @@ async function sendText(from, to, text, uniqueId) {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
           to: digits(to),
-          type: 'text',
-          text: {
-            preview_url: false,
-            body: normalizeText(text).slice(0, 4096),
-          },
+          ...content,
         }),
         signal: AbortSignal.timeout(25000),
       }
@@ -181,16 +224,13 @@ async function sendText(from, to, text, uniqueId) {
     const body = await response.json().catch(() => ({}));
     const accepted = response.ok && !!body.messages?.[0]?.id;
 
-    console.log('meta_send_result', {
-      status: response.status,
-      accepted,
-      errorCode: body.error?.code,
-      errorSubcode: body.error?.error_subcode,
-    });
+    if (accepted) rememberOnce(botMessages, body.messages[0].id, DAY);
+    log('meta_send_result', { channel: 'whatsapp', status: response.status, accepted });
 
     return {
       ok: accepted,
       status: response.status,
+      delivery: accepted ? idempotencyKey(body.messages[0].id) : undefined,
     };
   }
 
@@ -238,251 +278,257 @@ async function sendText(from, to, text, uniqueId) {
 function rememberOnce(map, key, ttlMs) {
   const now = Date.now();
 
-  for (const [item, until] of map) {
-    if (until < now) map.delete(item);
-  }
-
-  if (map.has(key)) return false;
+  if (map.get(key) > now) return false;
 
   map.set(key, now + ttlMs);
   return true;
 }
 
-async function processConversation(key, batch) {
-  const { event, texts, seq, ids } = batch;
-  const { data, account } = event;
+function conversationKey(channel, account, sender) {
+  return [channel, account, channel === 'whatsapp' ? comparePhone(sender) : sender].join(':');
+}
 
-  const to = data.from || data.user_id;
-  const from = digits(account?.display_phone_number);
+function pauseKey(key) {
+  return pauseSecret ? createHmac('sha256', pauseSecret).update(key).digest('hex') : key;
+}
 
-  if (!from || !to) return;
-  if (PROVIDER === 'meta' && !META_ACCESS_TOKEN) return;
-  if (PROVIDER === 'zapclaw' && !API_KEY) return;
-
-  console.log('conversation_processing', {
-    provider: PROVIDER,
-    messageCount: texts.length,
-  });
-
-  const allText = texts.join('\n');
-  const previous = sessions.get(key);
-
-  let reply;
-
+function savePauses() {
+  if (!pauseFile) return true;
   try {
-    if (previous) {
-      const choice = (previous.choices || []).find(
-        (x, i) =>
-          allText === String(i + 1) ||
-          allText.toLowerCase() === x.toLowerCase()
-      );
+    const temp = pauseFile + '.new';
+    const values = [...pauses].map(([key, until]) => [key, until === Infinity ? 0 : until]);
+    writeFileSync(temp, JSON.stringify(values), { mode: 0o600 });
+    renameSync(temp, pauseFile);
+    pauseStorageHealthy = true;
+  } catch {
+    pauseStorageHealthy = false;
+    log('pause_storage_error');
+  }
+  return pauseStorageHealthy;
+}
 
+function isPaused(key) {
+  if (!pauseStorageHealthy) return true;
+  const id = pauseKey(key);
+  const until = pauses.get(id);
+  if (until > Date.now()) return true;
+  pauses.delete(id);
+  return false;
+}
+
+function pause(key, duration = PAUSE_MS) {
+  const active = processing.get(key);
+  if (active) active.cancelled = true;
+  const id = pauseKey(key);
+  pauses.set(id, Math.max(pauses.get(id) || 0, duration === 0 ? Infinity : Date.now() + duration));
+  savePauses();
+  const queued = pending.get(key);
+  if (queued) {
+    clearTimeout(queued.timer);
+    pending.delete(key);
+  }
+  log('conversation_paused', { channel: key.split(':')[0], conversation: idempotencyKey(key) });
+}
+
+function safeTimestamp(timestamp) {
+  return Number.isFinite(timestamp) && timestamp > 0 && timestamp <= Date.now() + 60000
+    ? Math.min(timestamp, Date.now()) : 0;
+}
+
+function withinWindow(timestamp) {
+  return timestamp > 0 && Date.now() - timestamp < DAY;
+}
+
+async function instagram(path, body) {
+  const response = await fetch(IG_GRAPH + '/' + path, {
+    headers: { Authorization: 'Bearer ' + IG_TOKEN, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    log('instagram_request_failed', { channel: 'instagram', status: response.status });
+    throw new Error('instagram_request_failed');
+  }
+  return response.json();
+}
+
+function sendInstagram(to, text, key) {
+  const send = (async () => {
+    const result = await instagram(encodeURIComponent(IG_ID) + '/messages', {
+      recipient: { id: to }, message: { text: text.slice(0, 1000) },
+    });
+    if (result.message_id) rememberOnce(botMessages, result.message_id, DAY);
+    return { ok: !!result.message_id, delivery: result.message_id ? idempotencyKey(result.message_id) : undefined };
+  })();
+  instagramSends.set(key, send);
+  return send.finally(() => instagramSends.delete(key));
+}
+
+async function collectBatch(items, context, canSend) {
+  const blocks = [];
+  let failedMedia = false;
+  let hasAudio = false;
+  for (const { data } of items) {
+    const text = normalizeText(data.text?.body);
+    if (data.story) blocks.push('[Resposta a story]');
+    if (text) blocks.push(text);
+    for (const media of data.media || []) {
+      if (!canSend()) return { blocks, failedMedia, hasAudio };
+      const start = Date.now();
+      log('media_started', { ...context, type: media.type });
       try {
-        reply = await typebot(
-          `sessions/${encodeURIComponent(previous.id)}/continueChat`,
-          {
-            message: {
-              type: 'text',
-              text: choice || allText,
-            },
-          }
-        );
-      } catch (err) {
-        if (err.message !== 'typebot_404') throw err;
+        const detail = await interpretMedia(media, WA_GRAPH, META_ACCESS_TOKEN);
+        blocks.push((media.type === 'audio' ? '[Transcrição de áudio]\n' : '[Descrição de imagem]\n') + detail);
+        hasAudio ||= media.type === 'audio';
+        log('media_completed', { ...context, type: media.type, latencyMs: Date.now() - start });
+      } catch {
+        failedMedia = true;
+        blocks.push(media.type === 'audio' ? '[Falha ao transcrever áudio]' : '[Falha ao interpretar imagem]');
+        log('media_failed', { ...context, type: media.type, latencyMs: Date.now() - start });
+      }
+    }
+  }
+  return { blocks, failedMedia, hasAudio };
+}
+
+async function processConversation(key, items, active) {
+  const { channel, data, account } = items.at(-1);
+  const to = data.from;
+  const from = digits(account.display_phone_number) || digits(env.WHATSAPP_FROM);
+  const context = { channel, correlation: idempotencyKey(key + '/' + items.map(x => x.data.message_id).join('/')) };
+  log('batch_processing', { ...context, events: items.map(item => idempotencyKey(item.data.message_id)) });
+  const requiresWindow = channel === 'instagram' || PROVIDER === 'meta';
+  const canSend = () => !active.cancelled && !isPaused(key) && (!requiresWindow || withinWindow(lastIncoming.get(key)));
+  if (!canSend()) return;
+  if (channel === 'whatsapp' && (!from || (PROVIDER === 'meta' ? !META_ACCESS_TOKEN : !API_KEY))) return;
+
+  const started = Date.now();
+  try {
+    const { blocks, failedMedia, hasAudio } = await collectBatch(items, context, canSend);
+    if (!canSend()) return;
+    const allText = blocks.join('\n');
+    if (!allText) return;
+    let previous = sessions.get(key);
+    if (previous?.until <= Date.now()) {
+      sessions.delete(key);
+      previous = undefined;
+    }
+    let reply;
+    if (previous) {
+      const choice = previous.choices.find((text, index) =>
+        allText === String(index + 1) || allText.toLowerCase() === text.toLowerCase());
+      try {
+        reply = await typebot('sessions/' + encodeURIComponent(previous.id) + '/continueChat', {
+          message: { type: 'text', text: choice || allText },
+        });
+      } catch (error) {
+        if (error.message !== 'typebot_404') throw error;
+        previous = undefined;
       }
     }
 
+    let name = items.findLast(item => item.data.contact_name)?.data.contact_name || previous?.name || '';
+    let username = previous?.username || '';
     if (!reply) {
-      reply = await typebot(
-        `typebots/${encodeURIComponent(TYPEBOT_ID)}/startChat`,
-        {
-          message: {
-            type: 'text',
-            text: allText,
-          },
-          prefilledVariables: {
-            name: data.contact_name || '',
-            phone: to,
-          },
-        }
-      );
+      if (channel === 'instagram') {
+        const profile = await instagram(encodeURIComponent(to) + '?fields=name,username').catch(() => ({}));
+        name = profile.name || profile.username || '';
+        username = profile.username || '';
+      }
+      if (!canSend()) return;
+      reply = await typebot('typebots/' + encodeURIComponent(TYPEBOT_ID) + '/startChat', {
+        message: { type: 'text', text: allText },
+        prefilledVariables: {
+          name, phone: channel === 'whatsapp' ? to : '', channel, username,
+          contactId: to, professionalWhatsapp: 'https://wa.me/5521982995951',
+        },
+      });
     }
+    log('typebot_processed', { ...context, latencyMs: Date.now() - started });
 
     const choices = reply.input?.type === 'choice input'
-      ? (reply.input.items || [])
-          .map(item => item.content)
-          .filter(x => typeof x === 'string' && x)
+      ? (reply.input.items || []).map(item => item.content).filter(x => typeof x === 'string' && x)
       : [];
+    const sessionId = reply.sessionId || previous?.id;
+    if (!canSend()) return;
+    if (reply.input && sessionId) sessions.set(key, { id: sessionId, choices, name, username, until: Date.now() + DAY });
+    else sessions.delete(key);
 
-    if (reply.input && (reply.sessionId || previous?.id)) {
-      sessions.set(key, {
-        id: reply.sessionId || previous.id,
-        choices,
-      });
-    } else {
-      sessions.delete(key);
+    const bubbles = (reply.messages || []).filter(m => m.type === 'text' && typeof m.content?.markdown === 'string')
+      .map(m => m.content.markdown);
+    const required = channel === 'instagram' || env.TYPEBOT_REQUIRE_CONTROL === 'true';
+    const { messages, control, suppressed } = typebotControls(bubbles, required);
+    if (suppressed) return;
+    if (control) log('typebot_decision', { ...context, classification: control.category, action: control.action });
+    if (!canSend()) return;
+    if (control?.action === 'pause') pause(key, 0);
+    if (control?.action === 'handoff') {
+      const result = await notify({ from, to, channel, name, username, control, context });
+      log('handoff_result', { ...context, route: control.route, result });
+      if (!['accepted', 'dry_run', 'queued'].includes(result)) return;
     }
-
-    let messages = (reply.messages || [])
-      .filter(
-        m => m.type === 'text' &&
-        typeof m.content?.markdown === 'string'
-      )
-      .map(m => formatWhatsapp(m.content.markdown));
-
-    if (choices.length) {
-      messages.push(
-        choices.map((x, i) => `${i + 1}. ${x}`).join('\n')
-      );
+    if (choices.length && (control?.action === 'reply' || !required)) {
+      messages.push(choices.map((x, i) => (i + 1) + '. ' + x).join('\n'));
     }
-
-    messages = messages.filter(
-      m => m && m.trim().toUpperCase() !== SILENCE_TOKEN
-    );
-
-    if (!messages.length) {
-      console.log('typebot_no_reply');
-      return;
+    if (failedMedia && (messages.length || !required)) {
+      messages.push('Parte da mídia não pôde ser lida. Pode enviar essa parte por escrito?');
     }
-
-    if ((pending.get(key)?.seq || 0) > seq) {
-      console.log('reply_superseded');
-      return;
+    const addAudioHint = messages.length && hasAudio && !(audioHints.get(key) > Date.now());
+    if (addAudioHint) messages.push('Se puder, envie as próximas dúvidas por escrito.');
+    if (SEND_DELAY_MS && messages.length) await new Promise(resolve => setTimeout(resolve, SEND_DELAY_MS));
+    for (const [index, message] of messages.entries()) {
+      if (!canSend()) break;
+      const result = channel === 'instagram'
+        ? await sendInstagram(to, message, key)
+        : await sendText(from, to, formatWhatsapp(message), context.correlation + '/' + index);
+      log('reply_result', { ...context, accepted: result.ok, index, delivery: result.delivery });
+      if (!result.ok) break;
+      if (addAudioHint && index === messages.length - 1) rememberOnce(audioHints, key, 7 * DAY);
     }
-
-    if (SEND_DELAY_MS) {
-      await new Promise(
-        r => setTimeout(r, SEND_DELAY_MS)
-      );
-    }
-
-    for (let i = 0; i < messages.length; i++) {
-      if ((pending.get(key)?.seq || 0) > seq) break;
-
-      const result = await sendText(
-        from,
-        to,
-        messages[i],
-        `${key}/${ids.join('-')}/answer/${i}`
-      );
-
-      if (!result.ok) {
-        console.error(
-          'whatsapp_reply_failed',
-          result.status || 'unknown'
-        );
-        break;
-      }
-    }
-  } catch (err) {
-    console.error('conversation_error', err.name);
+  } catch (error) {
+    log('conversation_error', { ...context, type: error.name, latencyMs: Date.now() - started });
   }
 }
 
 function enqueueIncoming(event) {
   const { data, account } = event;
-  const sender = digits(data?.from);
-
-  if (!sender || !account?.phone_number_id) return;
-
-  if (!ALLOW_ALL && (!TEST_PHONE || !equalPhone(TEST_PHONE, sender))) {
-    console.log('test_phone_filtered');
+  const channel = event.channel || 'whatsapp';
+  event.channel = channel;
+  const sender = channel === 'instagram' ? data.from : digits(data.from);
+  if (!sender || !account?.phone_number_id || !data.message_id) return;
+  if (channel === 'instagram') {
+    if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(sender)) return;
+  } else if ((!ALLOW_ALL && !equalPhone(TEST_PHONE, sender)) ||
+      equalPhone(sender, account.display_phone_number) ||
+      notificationPhones.some(phone => equalPhone(phone, sender))) {
     return;
   }
-
-  if (equalPhone(sender, account?.display_phone_number)) {
-    return;
-  }
-
-  if (
-    equalPhone(sender, CLINIC_PHONE) ||
-    equalPhone(sender, PERSONAL_PHONE)
-  ) {
-    console.log('notification_destination_filtered');
-    return;
-  }
-
-  const id = `${account.phone_number_id}:${data.message_id}`;
-
-  if (
-    !data.message_id ||
-    !rememberOnce(recentMessageIds, id, 24 * 60 * 60 * 1000)
-  ) {
-    console.log('duplicate_message_filtered');
-    return;
-  }
-
-  const key = `${account.phone_number_id}:${comparePhone(sender)}`;
-  const text = normalizeText(data.text?.body);
-
-  if (!text) return;
-
+  const key = conversationKey(channel, account.phone_number_id, sender);
+  if (!rememberOnce(recentMessageIds, key + ':' + data.message_id, DAY)) return;
+  if (isPaused(key) || (!normalizeText(data.text?.body) && !data.media?.length)) return;
   let entry = pending.get(key);
-
   if (!entry) {
-    entry = {
-      texts: [],
-      ids: [],
-      seq: 0,
-      timer: null,
-      event,
-    };
+    entry = { items: [], timer: null };
+    pending.set(key, entry);
   }
+  entry.items.push(event);
+  clearTimeout(entry.timer);
+  log('message_queued', { channel, correlation: idempotencyKey(data.message_id), type: data.type, count: entry.items.length });
+  entry.timer = setTimeout(() => flush(key, entry), DEBOUNCE_MS);
+}
 
-  entry.texts.push(text);
-  entry.ids.push(data.message_id);
-  entry.event = event;
-  entry.seq++;
-
-  if (entry.timer) clearTimeout(entry.timer);
-
-  const selectedSeq = entry.seq;
-
-  console.log('message_queued', {
-    count: entry.texts.length,
-    debounceMs: DEBOUNCE_MS,
+function flush(key, entry) {
+  entry.timer = null;
+  if (processing.has(key) || pending.get(key) !== entry) return;
+  pending.delete(key);
+  const items = entry.items.sort((a, b) => (a.data.timestamp || 0) - (b.data.timestamp || 0));
+  const active = { cancelled: false };
+  processing.set(key, active);
+  void processConversation(key, items, active).finally(() => {
+    processing.delete(key);
+    const waiting = pending.get(key);
+    if (waiting && !waiting.timer) flush(key, waiting);
   });
-
-  entry.timer = setTimeout(() => {
-    const existing = pending.get(key);
-
-    if (!existing || existing.seq !== selectedSeq) return;
-
-    const batch = {
-      event: existing.event,
-      texts: existing.texts.splice(0),
-      ids: existing.ids.splice(0),
-      seq: selectedSeq,
-    };
-
-    existing.timer = null;
-
-    const earlier = processing.get(key) || Promise.resolve();
-
-    const run = earlier
-      .catch(() => {})
-      .then(() => processConversation(key, batch));
-
-    processing.set(key, run);
-
-    run.finally(() => {
-      if (processing.get(key) === run) {
-        processing.delete(key);
-
-        const current = pending.get(key);
-
-        if (
-          current &&
-          !current.timer &&
-          !current.texts.length
-        ) {
-          pending.delete(key);
-        }
-      }
-    });
-  }, DEBOUNCE_MS);
-
-  pending.set(key, entry);
 }
 
 function safeLine(s, max = 350) {
@@ -522,6 +568,87 @@ function buildHandoffMessage(p, kind) {
   ].join('\n');
 }
 
+function handoffDestination(route, from) {
+  const destination = HANDOFF_TEST_TO || destinations[route];
+  return equalPhone(from, destination) ? digits(env.HANDOFF_ALTERNATE_PHONE) : destination;
+}
+
+function notificationWindow(to) {
+  return withinWindow(lastIncoming.get(conversationKey('whatsapp', META_PHONE_NUMBER_ID, to)));
+}
+
+async function notify({ from, to, channel, name, username, control, context }) {
+  if (!HANDOFF_ENABLED) return 'disabled';
+  from = digits(env.WHATSAPP_FROM) || from;
+  const destination = handoffDestination(control.route, from);
+  if (!from || !destination || equalPhone(from, destination) || equalPhone(to, destination)) return 'invalid_destination';
+  if (NOTIFICATION_DRY_RUN) return 'dry_run';
+  const testMode = !ALLOW_ALL || (channel === 'instagram' && !IG_ALLOW_ALL);
+  if (testMode && !equalPhone(destination, HANDOFF_TEST_TO)) return 'test_destination_required';
+  const contact = channel === 'whatsapp' ? 'https://wa.me/' + digits(to) :
+    (/^[A-Za-z0-9_.]{1,30}$/.test(username) ? 'https://www.instagram.com/' + username + '/' : 'Localizar na caixa de entrada do Instagram');
+  const details = control.items.map((item, index) => [
+    'Demanda ' + (index + 1),
+    ...Object.entries(supportFields).map(([field, label]) => label + ': ' + (safeLine(item[field], 350) || 'Não informado')),
+  ].join('\n'));
+  const heading = control.route === 'support' ? 'SUPORTE PENDENTE' : control.route === 'finance' ? 'FINANCEIRO PENDENTE' : 'COMERCIAL PENDENTE';
+  const key = 'handoff/' + context.correlation;
+  if (!rememberOnce(recentHandoffs, key, DAY)) return 'duplicate';
+  const messages = details.map(detail => [
+    heading + ' — ' + control.category.toUpperCase(), 'Aluno: ' + (safeLine(name, 90) || 'Não informado'),
+    'Canal de origem: ' + channel, 'Link para contato: ' + contact, detail,
+  ].join('\n'));
+  if (PROVIDER === 'meta' && !notificationWindow(destination)) {
+    if (!env.HANDOFF_TEMPLATE_NAME) return 'template_required';
+    const destinationKey = comparePhone(destination);
+    const queue = waitingNotifications.get(destinationKey) || [];
+    if (queue.length >= 20) return 'queue_full';
+    const notification = { from, key, messages, expires: Date.now() + DAY, next: 0 };
+    queue.push(notification);
+    waitingNotifications.set(destinationKey, queue);
+    if (queue.length === 1) {
+      const result = await sendText(from, destination, '', key, env.HANDOFF_TEMPLATE_NAME);
+      if (!result.ok) return 'template_failed';
+    }
+    return 'queued';
+  }
+  return await deliverNotification(destination, { from, key, messages, next: 0 }) ? 'accepted' : 'failed';
+}
+
+async function deliverNotification(destination, notification) {
+  while (notification.next < notification.messages.length) {
+    if (PROVIDER === 'meta' && !notificationWindow(destination)) return false;
+    const index = notification.next;
+    const result = await sendText(notification.from, destination, notification.messages[index], notification.key + '/' + index);
+    if (!result.ok) return false;
+    notification.next++;
+  }
+  return true;
+}
+
+const notificationFlushes = new Set();
+async function flushNotifications(destination) {
+  const key = comparePhone(destination);
+  const queue = waitingNotifications.get(key);
+  if (!queue?.length || notificationFlushes.has(key)) return;
+  notificationFlushes.add(key);
+  try {
+    while (queue.length) {
+      const notification = queue[0];
+      if (notification.expires > Date.now()) {
+        if (!await deliverNotification(destination, notification)) break;
+        log('handoff_delivered', { channel: 'whatsapp', correlation: notification.key });
+      }
+      queue.shift();
+    }
+    if (!queue.length) waitingNotifications.delete(key);
+  } catch {
+    log('handoff_delivery_error', { channel: 'whatsapp' });
+  } finally {
+    notificationFlushes.delete(key);
+  }
+}
+
 async function handleHandoff(req, res) {
   if (
     !HANDOFF_SECRET ||
@@ -553,6 +680,7 @@ async function handleHandoff(req, res) {
     });
   }
 
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return json(res, 400, { ok: false });
   const kind = p.kind;
 
   if (!['lead', 'followup', 'support'].includes(kind)) {
@@ -595,8 +723,7 @@ async function handleHandoff(req, res) {
     });
   }
 
-  const to = HANDOFF_TEST_TO ||
-    (kind === 'support' ? PERSONAL_PHONE : CLINIC_PHONE);
+  const to = handoffDestination(kind === 'support' ? 'support' : 'commercial', from);
 
   if (!to) {
     return json(res, 422, {
@@ -612,7 +739,7 @@ async function handleHandoff(req, res) {
     });
   }
 
-  if (!ALLOW_ALL && !NOTIFICATION_DRY_RUN && !HANDOFF_TEST_TO) {
+  if (!ALLOW_ALL && !NOTIFICATION_DRY_RUN && !equalPhone(to, HANDOFF_TEST_TO)) {
     return json(res, 403, {
       ok: false,
       error: 'test_destination_required',
@@ -642,9 +769,7 @@ async function handleHandoff(req, res) {
   }
 
   if (PROVIDER === 'meta') {
-    const last = lastIncoming.get(comparePhone(to));
-
-    if (!last || Date.now() - last >= 24 * 60 * 60 * 1000) {
+    if (!notificationWindow(to)) {
       return json(res, 422, {
         ok: false,
         error: 'meta_approved_template_required',
@@ -682,8 +807,11 @@ async function handleHandoff(req, res) {
   });
 }
 
-async function handleMetaWebhook(req, res) {
+async function handleMetaWebhook(req, res, channel) {
   const url = new URL(req.url, 'http://localhost');
+  const instagramChannel = channel === 'instagram';
+  const verifyToken = instagramChannel ? (env.INSTAGRAM_VERIFY_TOKEN || META_VERIFY_TOKEN) : META_VERIFY_TOKEN;
+  const appSecret = instagramChannel ? (env.INSTAGRAM_APP_SECRET || META_APP_SECRET) : META_APP_SECRET;
 
   if (req.method === 'GET') {
     const mode = url.searchParams.get('hub.mode');
@@ -691,12 +819,12 @@ async function handleMetaWebhook(req, res) {
     const challenge = url.searchParams.get('hub.challenge');
 
     if (
-      META_VERIFY_TOKEN &&
+      verifyToken &&
       mode === 'subscribe' &&
       challenge !== null &&
-      secretMatches(token, META_VERIFY_TOKEN)
+      secretMatches(token, verifyToken)
     ) {
-      console.log('meta_webhook_verified');
+      log('webhook_verified', { channel });
 
       res.writeHead(200, {
         'Content-Type': 'text/plain',
@@ -720,7 +848,7 @@ async function handleMetaWebhook(req, res) {
     return json(res, 413, { ok: false });
   }
 
-  if (!META_APP_SECRET) {
+  if (!appSecret) {
     return json(res, 503, {
       ok: false,
       error: 'missing_meta_app_secret',
@@ -731,10 +859,10 @@ async function handleMetaWebhook(req, res) {
     !verifySignature(
       raw,
       req.headers['x-hub-signature-256'],
-      META_APP_SECRET
+      appSecret
     )
   ) {
-    console.log('meta_invalid_signature');
+    log('webhook_invalid_signature', { channel });
 
     return json(res, 401, {
       ok: false,
@@ -755,79 +883,55 @@ async function handleMetaWebhook(req, res) {
 
   json(res, 200, { ok: true });
 
-  if (PROVIDER !== 'meta') return;
-  if (payload.object !== 'whatsapp_business_account') return;
+  if (instagramChannel) {
+    receiveInstagram(payload);
+  } else if (PROVIDER === 'meta') {
+    receiveWhatsApp(payload);
+  }
+}
 
-  console.log('meta_webhook_received');
+function recordIncoming(key, timestamp) {
+  if (timestamp) lastIncoming.set(key, Math.max(lastIncoming.get(key) || 0, timestamp));
+}
 
+function receiveWhatsApp(payload) {
+  if (payload?.object !== 'whatsapp_business_account') return;
   for (const entry of payload.entry || []) {
     for (const change of entry.changes || []) {
-      if (change.field !== 'messages') continue;
-
       const value = change.value || {};
-      const metadata = value.metadata || {};
-
-      if (
-        String(metadata.phone_number_id) !==
-        String(META_PHONE_NUMBER_ID)
-      ) {
-        console.log('meta_wrong_phone_id');
+      const account = value.metadata || {};
+      if (!META_PHONE_NUMBER_ID || String(account.phone_number_id) !== META_PHONE_NUMBER_ID) continue;
+      const keyFor = sender => conversationKey('whatsapp', account.phone_number_id, sender);
+      if (change.field === 'smb_message_echoes') {
+        for (const echo of value.message_echoes || []) {
+          if (!echo.id || !digits(echo.to) || botMessages.get(echo.id) > Date.now() ||
+              !rememberOnce(recentMessageIds, 'wa-echo:' + echo.id, DAY)) continue;
+          pause(keyFor(echo.to));
+        }
         continue;
       }
-
+      if (change.field !== 'messages') continue;
       for (const status of value.statuses || []) {
-        console.log('meta_delivery_status', {
-          status: status.status,
-          errorCode: status.errors?.[0]?.code,
-        });
+        log('delivery_status', { channel: 'whatsapp', correlation: idempotencyKey(status.id), status: status.status });
       }
-
       for (const message of value.messages || []) {
         const sender = digits(message.from);
-
-        if (!sender) continue;
-
-        const receivedAt = Number(message.timestamp) * 1000;
-
-        if (
-          Number.isFinite(receivedAt) &&
-          receivedAt > 0 &&
-          receivedAt <= Date.now()
-        ) {
-          const phoneKey = comparePhone(sender);
-
-          lastIncoming.set(
-            phoneKey,
-            Math.max(lastIncoming.get(phoneKey) || 0, receivedAt)
-          );
-        }
-
-        if (message.type !== 'text') {
-          console.log('meta_unsupported_message_type');
-          continue;
-        }
-
-        const contact = (value.contacts || []).find(
-          c => equalPhone(c.wa_id, sender)
-        );
-
-        console.log('meta_message_received');
-
+        if (!sender || !message.id) continue;
+        const timestamp = safeTimestamp(Number(message.timestamp) * 1000);
+        recordIncoming(keyFor(sender), timestamp);
+        if (message.type === 'text' && timestamp && notificationWindow(sender)) void flushNotifications(sender);
+        log('message_received', { channel: 'whatsapp', correlation: idempotencyKey(message.id), type: message.type });
+        if (!['text', 'audio', 'image', 'interactive', 'button'].includes(message.type)) continue;
+        const attachment = ['audio', 'image'].includes(message.type) ? message[message.type] : undefined;
+        const contact = (value.contacts || []).find(item => equalPhone(item.wa_id, sender));
         enqueueIncoming({
-          event: 'message.received',
-          account: {
-            phone_number_id: metadata.phone_number_id,
-            display_phone_number: metadata.display_phone_number,
-          },
+          account,
           data: {
-            type: 'text',
-            from: sender,
-            user_id: sender,
-            message_id: message.id,
+            type: message.type, from: sender, message_id: message.id, timestamp,
             contact_name: contact?.profile?.name || '',
-            text: {
-              body: message.text?.body || '',
-            },
+            text: { body: message.text?.body || attachment?.caption ||
+              message.interactive?.button_reply?.title || message.interactive?.list_reply?.title || message.button?.text },
+            media: attachment?.id ? [{ type: message.type, id: attachment.id, mime: attachment.mime_type }] : [],
           },
         });
       }
@@ -835,7 +939,102 @@ async function handleMetaWebhook(req, res) {
   }
 }
 
-createServer(async (req, res) => {
+function receiveInstagram(payload) {
+  if (payload?.object !== 'instagram' || !IG_ID || !IG_TOKEN) return;
+  for (const entry of payload.entry || []) {
+    if (String(entry.id) !== IG_ID) continue;
+    const events = [...(entry.messaging || []), ...(entry.changes || [])
+      .filter(change => ['messages', 'messaging_seen', 'message_reactions'].includes(change.field))
+      .map(change => change.value)];
+    for (const event of events) {
+      const sender = String(event?.sender?.id || '');
+      const recipient = String(event?.recipient?.id || '');
+      const message = event?.message;
+      if (event?.read || event?.seen) {
+        log('delivery_status', { channel: 'instagram', status: 'seen', correlation: idempotencyKey(event.read?.mid || event.seen?.mid) });
+      }
+      if (!message?.mid || message.is_deleted || message.is_unsupported) continue;
+      if (sender === IG_ID && recipient !== IG_ID && /^\d+$/.test(recipient)) {
+        const key = conversationKey('instagram', IG_ID, recipient);
+        if (!rememberOnce(recentMessageIds, 'ig-echo:' + message.mid, DAY)) continue;
+        const check = () => {
+          if (!(botMessages.get(message.mid) > Date.now())) pause(key);
+        };
+        const inFlight = instagramSends.get(key);
+        if (inFlight) void inFlight.then(check, check);
+        else check();
+        continue;
+      }
+      if (recipient !== IG_ID || sender === IG_ID || !/^\d+$/.test(sender) ||
+          message.is_echo || message.is_self || message.is_self_reply || event.reaction) continue;
+      if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(sender)) continue;
+      const media = (message.attachments || []).filter(item =>
+        ['audio', 'image'].includes(item.type) && typeof item.payload?.url === 'string')
+        .map(item => ({ type: item.type, url: item.payload.url }));
+      const timestamp = safeTimestamp(Number(event.timestamp));
+      recordIncoming(conversationKey('instagram', IG_ID, sender), timestamp);
+      log('message_received', { channel: 'instagram', correlation: idempotencyKey(message.mid), type: message.reply_to?.story ? 'story_reply' : 'direct' });
+      enqueueIncoming({
+        channel: 'instagram',
+        account: { phone_number_id: IG_ID },
+        data: { type: media.length ? 'media' : 'text', from: sender, message_id: message.mid,
+          timestamp, text: { body: message.text }, media, story: !!message.reply_to?.story },
+      });
+    }
+  }
+}
+
+async function handlePause(req, res) {
+  if (!env.CONVERSATION_ADMIN_TOKEN ||
+      !secretMatches(req.headers['x-relay-token'], env.CONVERSATION_ADMIN_TOKEN)) {
+    return json(res, 401, { ok: false });
+  }
+  let data;
+  try {
+    data = JSON.parse((await readBody(req)).toString('utf8'));
+  } catch {
+    return json(res, 400, { ok: false });
+  }
+  const { channel, contact, action, durationMs, accountId } = data || {};
+  const account = channel === 'instagram' ? IG_ID : META_PHONE_NUMBER_ID || accountId;
+  if (!['instagram', 'whatsapp'].includes(channel) || !account || !/^\d+$/.test(String(contact)) ||
+      !['pause', 'resume'].includes(action) ||
+      (durationMs !== undefined && (!Number.isSafeInteger(durationMs) || durationMs < 0 || durationMs > 7 * DAY))) {
+    return json(res, 400, { ok: false });
+  }
+  const key = conversationKey(channel, account, String(contact));
+  if (action === 'resume') {
+    const active = processing.get(key);
+    if (active) active.cancelled = true;
+    const id = pauseKey(key);
+    const previous = pauses.get(id);
+    pauses.delete(id);
+    if (!savePauses() && previous) pauses.set(id, previous);
+    sessions.delete(key);
+    log('conversation_resumed', { channel, conversation: idempotencyKey(key) });
+  } else {
+    pause(key, durationMs);
+  }
+  if (!pauseStorageHealthy) return json(res, 503, { ok: false, error: 'pause_storage_error' });
+  return json(res, 200, { ok: true, paused: isPaused(key) });
+}
+
+// Expire in-memory identifiers and sessions even when a contact never returns.
+setInterval(() => {
+  const now = Date.now();
+  for (const map of [recentMessageIds, recentHandoffs, botMessages, audioHints, pauses]) {
+    for (const [key, expires] of map) if (expires <= now) map.delete(key);
+  }
+  for (const [key, timestamp] of lastIncoming) if (!withinWindow(timestamp)) lastIncoming.delete(key);
+  for (const [key, queue] of waitingNotifications) {
+    if (notificationFlushes.has(key)) continue;
+    while (queue[0]?.expires <= now) queue.shift();
+    if (!queue.length) waitingNotifications.delete(key);
+  }
+  for (const [key, session] of sessions) if (session.until <= now) sessions.delete(key);
+}, 60000).unref();
+
+export const server = createServer(async (req, res) => {
   try {
     const pathname = new URL(
       req.url,
@@ -845,7 +1044,17 @@ createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/') {
       return json(res, 200, {
         service: 'relay',
-        version: 3,
+        version: 4,
+        integrations: {
+          whatsapp: PROVIDER === 'meta' ? !!(META_ACCESS_TOKEN && META_PHONE_NUMBER_ID && META_APP_SECRET && META_VERIFY_TOKEN) : !!(API_KEY && WEBHOOK_SECRET),
+          instagram: !!(IG_TOKEN && IG_ID && (env.INSTAGRAM_APP_SECRET || META_APP_SECRET) && (env.INSTAGRAM_VERIFY_TOKEN || META_VERIFY_TOKEN)),
+          instagramTestOnly: !IG_ALLOW_ALL,
+          typebot: !!(TYPEBOT_API && TYPEBOT_ID),
+          media: !!env.OPENAI_API_KEY,
+          ffmpeg: !!ffmpeg,
+          pauseAdmin: !!env.CONVERSATION_ADMIN_TOKEN,
+          pausePersistence: !!pauseFile && pauseStorageHealthy,
+        },
         provider: PROVIDER,
         testOnly: !ALLOW_ALL,
         testPhoneConfigured: !!TEST_PHONE,
@@ -861,8 +1070,12 @@ createServer(async (req, res) => {
       });
     }
 
-    if (pathname === '/webhook/meta') {
-      return await handleMetaWebhook(req, res);
+    if (pathname === '/webhook/meta' || pathname === '/webhook/instagram') {
+      return await handleMetaWebhook(req, res, pathname.endsWith('/instagram') ? 'instagram' : 'whatsapp');
+    }
+
+    if (req.method === 'POST' && pathname === '/admin/conversation') {
+      return await handlePause(req, res);
     }
 
     if (req.method === 'POST' && pathname === '/handoff') {
@@ -919,7 +1132,7 @@ createServer(async (req, res) => {
       enqueueIncoming(event);
     }
   } catch (err) {
-    console.error('server_error', err.name);
+    log('server_error', { type: err.name });
 
     if (!res.headersSent) {
       return json(res, 500, { ok: false });
@@ -928,7 +1141,7 @@ createServer(async (req, res) => {
     if (!res.writableEnded) res.end();
   }
 }).listen(PORT, '0.0.0.0', () => {
-  console.log('relay_v3_ready', {
+  log('relay_v4_ready', {
     provider: PROVIDER,
     testOnly: !ALLOW_ALL,
     debounceMs: DEBOUNCE_MS,
