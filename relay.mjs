@@ -3,7 +3,7 @@
 // Relay V3 | Node.js 20+
 
 import { interpretMedia } from './media.mjs';
-import { supportFields, typebotControls } from './controls.mjs';
+import { isPublicText, supportFields, typebotControls } from './controls.mjs';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -162,7 +162,7 @@ async function readBody(req, maxBytes = 32768) {
   return Buffer.concat(parts);
 }
 
-async function typebot(path, payload) {
+async function typebot(path, payload, context, operation) {
   const response = await fetch(
     `${TYPEBOT_API}/v1/${path}`,
     {
@@ -179,7 +179,7 @@ async function typebot(path, payload) {
   );
 
   if (!response.ok) {
-    log('typebot_request_failed', { status: response.status });
+    log('typebot_request_failed', { ...context, operation, status: response.status });
     throw new Error(`typebot_${response.status}`);
   }
 
@@ -326,6 +326,9 @@ function pause(key, duration = PAUSE_MS) {
   if (queued) {
     clearTimeout(queued.timer);
     pending.delete(key);
+    for (const event of queued.items) {
+      log('message_ignored', { channel: event.channel, correlation: idempotencyKey(event.data.message_id), reason: 'paused' });
+    }
   }
   log('conversation_paused', { channel: key.split(':')[0], conversation: idempotencyKey(key) });
 }
@@ -391,23 +394,75 @@ async function collectBatch(items, context, canSend) {
   return { blocks, failedMedia, hasAudio };
 }
 
+const TURN_RETRY_TEXT = 'Tive uma dificuldade para responder agora. Pode reenviar sua última mensagem?';
+const HANDOFF_UNAVAILABLE_TEXT = 'Neste momento, não consegui concluir o encaminhamento. Posso continuar ajudando por aqui?';
+
+// The relay, not the model, owns the outcome of actions involving other systems.
+const completedAction = /\b(?:encaminhei|transferi|repassei|notifiquei|acionei|agendei|reservei|protocolei|confirmei|registrei|realizei|enviei|avisei|solicitei|conclu[ií]|efetivei|marquei|remarquei|cancelei|lancei|validei|processei)\b/iu;
+const actionStatus = /\b(?:[eé]|foi|foram|est[áã]o?|ficou|ficaram|segue|seguem|j[áa])\s+(?:[\p{L}]+\s+){0,3}(?:encaminhad|transferid|repassad|notificad|acionad|agendad|reservad|protocolad|confirmad|registrad|realizad|enviad|avisad|solicitad|conclu[ií]d|efetivad|marcad|remarcad|cancelad|validad|processad|na fila|em andamento)/iu;
+const standAloneConfirmation = /(?:^|[.!?]\s+)(?:tudo certo[.!]|(?:pedido|pagamento|consulta|hor[aá]rio|solicita[çc][aã]o|retorno)\s+(?:confirmad|agendad|encaminhad|recebid[oa] pela|registrad|enviad|validad))/iu;
+const handoffPromise = /\b(?:vou|vamos|iremos|irei|fico de|posso|deixe que eu)\s+(?:\w+\s+){0,3}(?:encaminh|pass|transfer|repass|notifi|acion|agend|reserv|protocol|confirm|registr|realiz|envi|avis|solicit|deix|ped|conclu|efetiv|abr|retorn)|\b(?:encaminharei|avisarei|enviarei|repassarei|registrarei|agendarei|confirmarei|retornarei)\b|\b(?:equipe|recep[çc][aã]o|respons[aá]vel|profissional|dayane)\b.{0,45}\b(?:recebeu|receber[aá]|retornar[aá]|responder[aá]|vai retornar|vai responder|entrar[aá] em contato|vai entrar em contato|foi acionad)/iu;
+
+function makesActionClaim(text) {
+  return completedAction.test(text) || actionStatus.test(text) || standAloneConfirmation.test(text);
+}
+
+function independentPublicText(text, filterPromises = false) {
+  const sentences = text.split(/(?<=[.!?;])\s+|\n+/u);
+  const safe = sentences.filter(part => !makesActionClaim(part) && (!filterPromises || !handoffPromise.test(part)));
+  return safe.length === sentences.length ? text : safe.join(' ').trim();
+}
+
 async function processConversation(key, items, active) {
   const { channel, data, account } = items.at(-1);
   const to = data.from;
   const from = digits(account.display_phone_number) || digits(env.WHATSAPP_FROM);
-  const context = { channel, correlation: idempotencyKey(key + '/' + items.map(x => x.data.message_id).join('/')) };
-  log('batch_processing', { ...context, events: items.map(item => idempotencyKey(item.data.message_id)) });
-  const requiresWindow = channel === 'instagram' || PROVIDER === 'meta';
-  const canSend = () => !active.cancelled && !isPaused(key) && (!requiresWindow || withinWindow(lastIncoming.get(key)));
-  if (!canSend()) return;
-  if (channel === 'whatsapp' && (!from || (PROVIDER === 'meta' ? !META_ACCESS_TOKEN : !API_KEY))) return;
-
+  const context = {
+    channel,
+    correlation: idempotencyKey(key + '/' + items.map(x => x.data.message_id).join('/')),
+    conversation: idempotencyKey(key),
+  };
   const started = Date.now();
+  const finish = (reason, fields = {}) => log('conversation_outcome', {
+    ...context, reason, latencyMs: Date.now() - started, ...fields,
+  });
+  const requiresWindow = channel === 'instagram' || PROVIDER === 'meta';
+  function blocked() {
+    if (!pauseStorageHealthy) return 'pause_storage_unavailable';
+    if (isPaused(key)) return 'paused';
+    if (active.cancelled) return 'cancelled';
+    if (requiresWindow && !withinWindow(lastIncoming.get(key))) return 'window_expired';
+  }
+  log('batch_processing', { ...context, events: items.map(item => idempotencyKey(item.data.message_id)) });
+  if (blocked()) return finish(blocked());
+  if (channel === 'whatsapp' && (!from || (PROVIDER === 'meta' ? !META_ACCESS_TOKEN : !API_KEY))) {
+    return finish('provider_unconfigured');
+  }
+
+  let stage = 'media';
+  let operation;
+  let planReason;
+  let handoffResult;
+  let sent = 0;
+  async function sendPublic(messages) {
+    if (SEND_DELAY_MS && messages.length) await new Promise(resolve => setTimeout(resolve, SEND_DELAY_MS));
+    for (const [index, message] of messages.entries()) {
+      if (blocked()) return blocked();
+      const result = channel === 'instagram'
+        ? await sendInstagram(to, message, key)
+        : await sendText(from, to, formatWhatsapp(message), context.correlation + '/' + index);
+      log('reply_result', { ...context, accepted: result.ok, index, delivery: result.delivery, status: result.status });
+      if (!result.ok) return 'send_failed';
+      sent++;
+    }
+  }
+
   try {
-    const { blocks, failedMedia, hasAudio } = await collectBatch(items, context, canSend);
-    if (!canSend()) return;
+    const { blocks, failedMedia, hasAudio } = await collectBatch(items, context, () => !blocked());
+    if (blocked()) return finish(blocked());
     const allText = blocks.join('\n');
-    if (!allText) return;
+    if (!allText) return finish('empty_input');
+    stage = 'typebot';
     let previous = sessions.get(key);
     if (previous?.until <= Date.now()) {
       sessions.delete(key);
@@ -417,12 +472,15 @@ async function processConversation(key, items, active) {
     if (previous) {
       const choice = previous.choices.find((text, index) =>
         allText === String(index + 1) || allText.toLowerCase() === text.toLowerCase());
+      operation = 'continueChat';
       try {
         reply = await typebot('sessions/' + encodeURIComponent(previous.id) + '/continueChat', {
           message: { type: 'text', text: choice || allText },
-        });
+        }, context, operation);
       } catch (error) {
         if (error.message !== 'typebot_404') throw error;
+        log('typebot_session_reset', { ...context, reason: 'session_not_found' });
+        sessions.delete(key);
         previous = undefined;
       }
     }
@@ -435,58 +493,105 @@ async function processConversation(key, items, active) {
         name = profile.name || profile.username || '';
         username = profile.username || '';
       }
-      if (!canSend()) return;
+      if (blocked()) return finish(blocked());
+      operation = 'startChat';
       reply = await typebot('typebots/' + encodeURIComponent(TYPEBOT_ID) + '/startChat', {
         message: { type: 'text', text: allText },
         prefilledVariables: {
           name, phone: channel === 'whatsapp' ? to : '', channel, username,
           contactId: to, professionalWhatsapp: 'https://wa.me/5521982995951',
         },
-      });
+      }, context, operation);
     }
-    log('typebot_processed', { ...context, latencyMs: Date.now() - started });
-
-    const choices = reply.input?.type === 'choice input'
-      ? (reply.input.items || []).map(item => item.content).filter(x => typeof x === 'string' && x)
+    if (!reply || typeof reply !== 'object' || Array.isArray(reply) || (reply.messages != null && !Array.isArray(reply.messages))) {
+      throw new Error('invalid_typebot_response');
+    }
+    const choices = reply.input?.type === 'choice input' && Array.isArray(reply.input.items)
+      ? reply.input.items.map(item => item?.content).filter(text => typeof text === 'string' && isPublicText(text))
       : [];
     const sessionId = reply.sessionId || previous?.id;
-    if (!canSend()) return;
-    if (reply.input && sessionId) sessions.set(key, { id: sessionId, choices, name, username, until: Date.now() + DAY });
-    else sessions.delete(key);
-
-    const bubbles = (reply.messages || []).filter(m => m.type === 'text' && typeof m.content?.markdown === 'string')
+    const bubbles = (reply.messages || []).filter(m => m?.type === 'text' && typeof m.content?.markdown === 'string')
       .map(m => m.content.markdown);
-    const required = channel === 'instagram' || env.TYPEBOT_REQUIRE_CONTROL === 'true';
-    const { messages, control, suppressed } = typebotControls(bubbles, required);
-    if (suppressed) return;
-    if (control) log('typebot_decision', { ...context, classification: control.category, action: control.action });
-    if (!canSend()) return;
-    if (control?.action === 'pause') pause(key, 0);
-    if (control?.action === 'handoff') {
-      const result = await notify({ from, to, channel, name, username, control, context });
-      log('handoff_result', { ...context, route: control.route, result });
-      if (!['accepted', 'dry_run', 'queued'].includes(result)) return;
+    log('typebot_processed', { ...context, operation, hasInput: !!reply.input,
+      textBlocks: bubbles.length, latencyMs: Date.now() - started });
+    if (blocked()) return finish(blocked());
+    if (reply.input && typeof sessionId === 'string' && sessionId) {
+      sessions.set(key, { id: sessionId, choices, name, username, until: Date.now() + DAY });
+    } else {
+      sessions.delete(key);
     }
-    if (choices.length && (control?.action === 'reply' || !required)) {
+
+    stage = 'control';
+    const required = channel === 'instagram' || env.TYPEBOT_REQUIRE_CONTROL === 'true';
+    const parsed = typebotControls(bubbles, required);
+    const { control, reason } = parsed;
+    let messages = parsed.messages;
+    if (control) log('typebot_decision', { ...context, classification: control.category, action: control.action });
+    if (reason === 'intentional_silence') return finish(reason);
+    if (blocked()) return finish(blocked());
+    if (control?.action === 'pause') {
+      pause(key, 0);
+      return finish('paused_by_typebot');
+    }
+    if (control?.action === 'handoff') {
+      try {
+        handoffResult = await notify({ from, to, channel, name, username, control, context });
+      } catch (error) {
+        handoffResult = 'exception';
+        log('handoff_error', { ...context, type: error.name });
+      }
+      log('handoff_result', { ...context, route: control.route, result: handoffResult });
+      const originalCount = messages.length;
+      const independent = messages.map(text => independentPublicText(text, true)).filter(Boolean);
+      const changed = independent.length !== originalCount || independent.some((text, i) => text !== messages[i]);
+      messages = independent;
+      if ((changed || !messages.length) && !['accepted', 'queued'].includes(handoffResult)) {
+        messages.push(HANDOFF_UNAVAILABLE_TEXT);
+      }
+      planReason = changed ? 'handoff_status_filtered' : 'handoff';
+    }
+    if (reason) {
+      planReason = reason;
+      messages = messages.map(text => independentPublicText(text, true)).filter(Boolean);
+      if (!messages.length) messages.push(TURN_RETRY_TEXT);
+    }
+    if (!reason && control?.action !== 'handoff') {
+      const filtered = messages.map(text => makesActionClaim(text) ? independentPublicText(text) : text).filter(Boolean);
+      if (filtered.length !== messages.length || filtered.some((text, i) => text !== messages[i])) {
+        planReason = 'unverified_action_filtered';
+        messages = filtered;
+      }
+    }
+    if (choices.length && !reason && (control?.action === 'reply' || (!required && !control))) {
       messages.push(choices.map((x, i) => (i + 1) + '. ' + x).join('\n'));
     }
     if (failedMedia && (messages.length || !required)) {
       messages.push('Parte da mídia não pôde ser lida. Pode enviar essa parte por escrito?');
     }
-    const addAudioHint = messages.length && hasAudio && !(audioHints.get(key) > Date.now());
-    if (addAudioHint) messages.push('Se puder, envie as próximas dúvidas por escrito.');
-    if (SEND_DELAY_MS && messages.length) await new Promise(resolve => setTimeout(resolve, SEND_DELAY_MS));
-    for (const [index, message] of messages.entries()) {
-      if (!canSend()) break;
-      const result = channel === 'instagram'
-        ? await sendInstagram(to, message, key)
-        : await sendText(from, to, formatWhatsapp(message), context.correlation + '/' + index);
-      log('reply_result', { ...context, accepted: result.ok, index, delivery: result.delivery });
-      if (!result.ok) break;
-      if (addAudioHint && index === messages.length - 1) rememberOnce(audioHints, key, 7 * DAY);
+    if (!messages.length) {
+      if (['accepted', 'queued'].includes(handoffResult)) {
+        return finish('handoff_without_public_reply', { handoffResult });
+      }
+      planReason ||= 'empty_public_reply';
+      messages.push(TURN_RETRY_TEXT);
     }
+    const addAudioHint = hasAudio && !(audioHints.get(key) > Date.now());
+    if (addAudioHint) messages.push('Se puder, envie as próximas dúvidas por escrito.');
+    stage = 'send';
+    const failure = await sendPublic(messages);
+    if (!failure && addAudioHint) rememberOnce(audioHints, key, 7 * DAY);
+    return finish(failure || 'reply_sent', { detail: planReason, handoffResult, sent });
   } catch (error) {
-    log('conversation_error', { ...context, type: error.name, latencyMs: Date.now() - started });
+    log('conversation_error', {
+      ...context, stage, operation, type: error?.name || 'Error', latencyMs: Date.now() - started,
+    });
+    if (stage !== 'typebot' || blocked()) return finish(blocked() || stage + '_failed', { handoffResult, sent });
+    try {
+      const failure = await sendPublic([TURN_RETRY_TEXT]);
+      return finish(failure || 'reply_sent', { detail: 'typebot_failed', sent });
+    } catch {
+      return finish('send_failed', { detail: 'typebot_failed', sent });
+    }
   }
 }
 
@@ -495,17 +600,21 @@ function enqueueIncoming(event) {
   const channel = event.channel || 'whatsapp';
   event.channel = channel;
   const sender = channel === 'instagram' ? data.from : digits(data.from);
-  if (!sender || !account?.phone_number_id || !data.message_id) return;
+  const correlation = data.message_id ? idempotencyKey(data.message_id) : undefined;
+  const skip = reason => log('message_ignored', { channel, correlation, reason });
+  if (!sender || !account?.phone_number_id || !data.message_id) return skip('invalid_event');
   if (channel === 'instagram') {
-    if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(sender)) return;
-  } else if ((!ALLOW_ALL && !equalPhone(TEST_PHONE, sender)) ||
-      equalPhone(sender, account.display_phone_number) ||
-      notificationPhones.some(phone => equalPhone(phone, sender))) {
-    return;
+    if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(sender)) return skip('outside_test_allowlist');
+  } else {
+    if (!ALLOW_ALL && !equalPhone(TEST_PHONE, sender)) return skip('outside_test_allowlist');
+    if (equalPhone(sender, account.display_phone_number)) return skip('own_message');
+    if (notificationPhones.some(phone => equalPhone(phone, sender))) return skip('notification_contact');
   }
   const key = conversationKey(channel, account.phone_number_id, sender);
-  if (!rememberOnce(recentMessageIds, key + ':' + data.message_id, DAY)) return;
-  if (isPaused(key) || (!normalizeText(data.text?.body) && !data.media?.length)) return;
+  if (!rememberOnce(recentMessageIds, key + ':' + data.message_id, DAY)) return skip('duplicate');
+  if (!pauseStorageHealthy) return skip('pause_storage_unavailable');
+  if (isPaused(key)) return skip('paused');
+  if (!normalizeText(data.text?.body) && !data.media?.length) return skip('empty_input');
   let entry = pending.get(key);
   if (!entry) {
     entry = { items: [], timer: null };
@@ -524,7 +633,11 @@ function flush(key, entry) {
   const items = entry.items.sort((a, b) => (a.data.timestamp || 0) - (b.data.timestamp || 0));
   const active = { cancelled: false };
   processing.set(key, active);
-  void processConversation(key, items, active).finally(() => {
+  void processConversation(key, items, active).catch(() => {
+    log('conversation_outcome', {
+      channel: items[0]?.channel, conversation: idempotencyKey(key), reason: 'unexpected_failure',
+    });
+  }).finally(() => {
     processing.delete(key);
     const waiting = pending.get(key);
     if (waiting && !waiting.timer) flush(key, waiting);
@@ -967,7 +1080,10 @@ function receiveInstagram(payload) {
       }
       if (recipient !== IG_ID || sender === IG_ID || !/^\d+$/.test(sender) ||
           message.is_echo || message.is_self || message.is_self_reply || event.reaction) continue;
-      if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(sender)) continue;
+      if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(sender)) {
+        log('message_ignored', { channel: 'instagram', correlation: idempotencyKey(message.mid), reason: 'outside_test_allowlist' });
+        continue;
+      }
       const media = (message.attachments || []).filter(item =>
         ['audio', 'image'].includes(item.type) && typeof item.payload?.url === 'string')
         .map(item => ({ type: item.type, url: item.payload.url }));

@@ -14,14 +14,18 @@ const account = '99';
 const secret = 'fake-signing-secret';
 const admin = 'fake-admin-secret';
 
-test('Typebot preserva texto legado e bloqueia controle inválido, pessoal ou silencioso', () => {
+test('Typebot preserva texto seguro e distingue controle inválido de silêncio', () => {
   assert.deepEqual(typebotControls(['[Veja](https://example.com)'], false).messages, ['[Veja](https://example.com)']);
   assert.deepEqual(typebotControls(['Olá'], true).messages, []);
   assert.deepEqual(typebotControls(['Olá', '[[SEM_RESPOSTA]]'], false).messages, []);
-  assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]invalid'], false).messages, []);
+  assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]invalid'], false), { messages: ['Olá'], reason: 'invalid_control' });
   assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]{"action":"reply","category":"personal"}'], true).messages, []);
   assert.deepEqual(typebotControls(['Olá', replyControl], true).messages, ['Olá']);
-  assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]{"action":"handoff","category":"support","route":"support","items":[{}]}'], true).messages, []);
+  assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]{"action":"handoff","category":"support","route":"support","items":[{}]}'], true), { messages: ['Olá'], reason: 'invalid_control' });
+  assert.deepEqual(typebotControls([replyControl + '\nComo posso ajudar?'], true).messages, ['Como posso ajudar?']);
+  assert.equal(typebotControls([replyControl, replyControl], true).reason, 'duplicate_control');
+  assert.equal(typebotControls(['Olá', '{"decision":{"action":"reply"}}'], true).reason, 'unsafe_public_text');
+  assert.equal(typebotControls(['Olá', '[[RELAY_V1]]{"action":"ignore","category":"no_reply"}'], true).reason, 'intentional_silence');
 });
 
 test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicatas e pausa', async t => {
