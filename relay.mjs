@@ -26,6 +26,12 @@ const IG_GRAPH = 'https://graph.instagram.com/' + (env.INSTAGRAM_GRAPH_VERSION |
 const WA_GRAPH = 'https://graph.facebook.com/' + META_GRAPH_VERSION;
 const IG_TEST_USERS = new Set((env.INSTAGRAM_TEST_USERS || '').split(',').map(x => x.trim()).filter(Boolean));
 const IG_ALLOW_ALL = env.INSTAGRAM_ALLOW_ALL_CONTACTS === 'true';
+const diagnosticUsername = (env.INSTAGRAM_TEST_DIAGNOSTIC_USERNAME || '').trim().replace(/^@/, '').toLowerCase();
+const diagnosticText = 'Diagnóstico Instagram V4';
+const diagnosticDeadline = Date.now() + 15 * 60000;
+const diagnosticAttempted = new Set();
+let diagnosticMatched = false;
+let diagnosticBusy = false;
 const DAY = 86400000;
 const ffmpeg = process.env.OPENAI_API_KEY && spawnSync(env.FFMPEG_PATH || 'ffmpeg', ['-version'], { stdio: 'ignore', timeout: 5000 }).status === 0;
 const PAUSE_MS = bounded(env.HUMAN_PAUSE_MS, 3600000, 1000, 7 * DAY);
@@ -68,7 +74,7 @@ const TYPEBOT_ID = env.TYPEBOT_PUBLIC_ID || 'assistente-felipe-f1w96o8';
 const TEST_PHONE = digits(env.TEST_PHONE);
 const ALLOW_ALL = env.ALLOW_ALL_CONTACTS === 'true';
 
-const DEBOUNCE_MS = bounded(env.DEBOUNCE_MS, 10000, 5000, 45000);
+const DEBOUNCE_MS = bounded(env.DEBOUNCE_MS, 20000, 5000, 45000);
 
 const SEND_DELAY_MS = Math.min(
   8000,
@@ -91,6 +97,23 @@ const notificationPhones = [...Object.values(destinations), CLINIC_PHONE, PERSON
   digits(env.HANDOFF_ALTERNATE_PHONE)].filter(Boolean);
 
 const sessions = new Map();
+const sessionStatePath = env.SESSION_STATE_PATH;
+let sessionStorageHealthy = false;
+if (sessionStatePath && (!pauseSecret || sessionStatePath === pauseFile)) {
+  throw new Error('session_storage_requires_distinct_path_and_secret');
+}
+if (sessionStatePath) {
+  try {
+    const entries = JSON.parse(readFileSync(sessionStatePath, 'utf8'));
+    for (const [key, id] of entries) {
+      if (/^[a-f0-9]{64}$/.test(key) && typeof id === 'string' && id) sessions.set(key, { id, choices: [] });
+    }
+    sessionStorageHealthy = true;
+  } catch (error) {
+    if (error.code === 'ENOENT') saveSessions();
+    else log('session_storage_unreadable');
+  }
+}
 const pending = new Map();
 const processing = new Map();
 const recentMessageIds = new Map();
@@ -292,6 +315,27 @@ function pauseKey(key) {
   return pauseSecret ? createHmac('sha256', pauseSecret).update(key).digest('hex') : key;
 }
 
+function saveSessions() {
+  if (!sessionStatePath) return;
+  try {
+    const temp = sessionStatePath + '.new';
+    const values = [...sessions].map(([key, session]) => [key, session.id]);
+    writeFileSync(temp, JSON.stringify(values), { mode: 0o600 });
+    renameSync(temp, sessionStatePath);
+    sessionStorageHealthy = true;
+  } catch {
+    sessionStorageHealthy = false;
+    log('session_storage_error');
+  }
+}
+
+function setSession(key, value) {
+  const previous = sessions.get(key);
+  if (value) sessions.set(key, value);
+  else sessions.delete(key);
+  if (previous?.id !== value?.id || !sessionStorageHealthy) saveSessions();
+}
+
 function savePauses() {
   if (!pauseFile) return true;
   try {
@@ -422,6 +466,7 @@ async function processConversation(key, items, active) {
     correlation: idempotencyKey(key + '/' + items.map(x => x.data.message_id).join('/')),
     conversation: idempotencyKey(key),
   };
+  const sessionKey = pauseKey(JSON.stringify(['typebot', TYPEBOT_API, TYPEBOT_ID, key]));
   const started = Date.now();
   const finish = (reason, fields = {}) => log('conversation_outcome', {
     ...context, reason, latencyMs: Date.now() - started, ...fields,
@@ -463,9 +508,9 @@ async function processConversation(key, items, active) {
     const allText = blocks.join('\n');
     if (!allText) return finish('empty_input');
     stage = 'typebot';
-    let previous = sessions.get(key);
-    if (previous?.until <= Date.now()) {
-      sessions.delete(key);
+    let previous = sessions.get(sessionKey);
+    if (!sessionStatePath && previous?.until <= Date.now()) {
+      setSession(sessionKey);
       previous = undefined;
     }
     let reply;
@@ -480,7 +525,7 @@ async function processConversation(key, items, active) {
       } catch (error) {
         if (error.message !== 'typebot_404') throw error;
         log('typebot_session_reset', { ...context, reason: 'session_not_found' });
-        sessions.delete(key);
+        setSession(sessionKey);
         previous = undefined;
       }
     }
@@ -514,26 +559,23 @@ async function processConversation(key, items, active) {
       .map(m => m.content.markdown);
     log('typebot_processed', { ...context, operation, hasInput: !!reply.input,
       textBlocks: bubbles.length, latencyMs: Date.now() - started });
-    if (blocked()) return finish(blocked());
     if (reply.input && typeof sessionId === 'string' && sessionId) {
-      sessions.set(key, { id: sessionId, choices, name, username, until: Date.now() + DAY });
+      const unrestricted = channel === 'instagram' ? IG_ALLOW_ALL : ALLOW_ALL;
+      setSession(sessionKey, { id: sessionId, choices, name, username, until: unrestricted ? Date.now() + DAY : Infinity });
     } else {
-      sessions.delete(key);
+      setSession(sessionKey);
     }
+    if (blocked()) return finish(blocked());
 
     stage = 'control';
     const required = channel === 'instagram' || env.TYPEBOT_REQUIRE_CONTROL === 'true';
     const parsed = typebotControls(bubbles, required);
-    const { control, reason } = parsed;
+    const { control } = parsed;
+    const reason = parsed.reason || (control?.action === 'pause' ? 'typebot_pause_recovered' : undefined);
     let messages = parsed.messages;
     if (control) log('typebot_decision', { ...context, classification: control.category, action: control.action });
-    if (reason === 'intentional_silence') return finish(reason);
     if (blocked()) return finish(blocked());
-    if (control?.action === 'pause') {
-      pause(key, 0);
-      return finish('paused_by_typebot');
-    }
-    if (control?.action === 'handoff') {
+    if (!reason && control?.action === 'handoff') {
       try {
         handoffResult = await notify({ from, to, channel, name, username, control, context });
       } catch (error) {
@@ -608,7 +650,9 @@ function enqueueIncoming(event) {
   } else {
     if (!ALLOW_ALL && !equalPhone(TEST_PHONE, sender)) return skip('outside_test_allowlist');
     if (equalPhone(sender, account.display_phone_number)) return skip('own_message');
-    if (notificationPhones.some(phone => equalPhone(phone, sender))) return skip('notification_contact');
+    if (HANDOFF_ENABLED && !NOTIFICATION_DRY_RUN && notificationPhones.some(phone => equalPhone(phone, sender))) {
+      return skip('notification_contact');
+    }
   }
   const key = conversationKey(channel, account.phone_number_id, sender);
   if (!rememberOnce(recentMessageIds, key + ':' + data.message_id, DAY)) return skip('duplicate');
@@ -1052,6 +1096,29 @@ function receiveWhatsApp(payload) {
   }
 }
 
+function instagramDiagnosticActive() {
+  return !IG_ALLOW_ALL && !diagnosticMatched && Date.now() < diagnosticDeadline &&
+    /^[a-z0-9_.]{1,30}$/.test(diagnosticUsername);
+}
+
+async function diagnoseInstagramSender(sender, timestamp) {
+  if (!instagramDiagnosticActive() || diagnosticBusy || !timestamp ||
+      Date.now() - timestamp > 120000 || diagnosticAttempted.has(sender) || diagnosticAttempted.size >= 5) return;
+  diagnosticAttempted.add(sender);
+  diagnosticBusy = true;
+  try {
+    const profile = await instagram(encodeURIComponent(sender) + '?fields=username');
+    if (profile?.username?.toLowerCase() === diagnosticUsername && instagramDiagnosticActive()) {
+      diagnosticMatched = true;
+      log('instagram_test_sender_verified', { channel: 'instagram', senderId: sender });
+    }
+  } catch {
+    log('instagram_test_sender_lookup_failed', { channel: 'instagram' });
+  } finally {
+    diagnosticBusy = false;
+  }
+}
+
 function receiveInstagram(payload) {
   if (payload?.object !== 'instagram' || !IG_ID || !IG_TOKEN) return;
   for (const entry of payload.entry || []) {
@@ -1068,6 +1135,7 @@ function receiveInstagram(payload) {
       }
       if (!message?.mid || message.is_deleted || message.is_unsupported) continue;
       if (sender === IG_ID && recipient !== IG_ID && /^\d+$/.test(recipient)) {
+        if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(recipient)) continue;
         const key = conversationKey('instagram', IG_ID, recipient);
         if (!rememberOnce(recentMessageIds, 'ig-echo:' + message.mid, DAY)) continue;
         const check = () => {
@@ -1080,6 +1148,12 @@ function receiveInstagram(payload) {
       }
       if (recipient !== IG_ID || sender === IG_ID || !/^\d+$/.test(sender) ||
           message.is_echo || message.is_self || message.is_self_reply || event.reaction) continue;
+      const timestamp = safeTimestamp(Number(event.timestamp));
+      if (instagramDiagnosticActive() && message.text?.trim() === diagnosticText) {
+        void diagnoseInstagramSender(sender, timestamp);
+        log('message_ignored', { channel: 'instagram', correlation: idempotencyKey(message.mid), reason: 'diagnostic_probe' });
+        continue;
+      }
       if (!IG_ALLOW_ALL && !IG_TEST_USERS.has(sender)) {
         log('message_ignored', { channel: 'instagram', correlation: idempotencyKey(message.mid), reason: 'outside_test_allowlist' });
         continue;
@@ -1087,7 +1161,6 @@ function receiveInstagram(payload) {
       const media = (message.attachments || []).filter(item =>
         ['audio', 'image'].includes(item.type) && typeof item.payload?.url === 'string')
         .map(item => ({ type: item.type, url: item.payload.url }));
-      const timestamp = safeTimestamp(Number(event.timestamp));
       recordIncoming(conversationKey('instagram', IG_ID, sender), timestamp);
       log('message_received', { channel: 'instagram', correlation: idempotencyKey(message.mid), type: message.reply_to?.story ? 'story_reply' : 'direct' });
       enqueueIncoming({
@@ -1114,7 +1187,7 @@ async function handlePause(req, res) {
   const { channel, contact, action, durationMs, accountId } = data || {};
   const account = channel === 'instagram' ? IG_ID : META_PHONE_NUMBER_ID || accountId;
   if (!['instagram', 'whatsapp'].includes(channel) || !account || !/^\d+$/.test(String(contact)) ||
-      !['pause', 'resume'].includes(action) ||
+      !['pause', 'resume', 'status'].includes(action) ||
       (durationMs !== undefined && (!Number.isSafeInteger(durationMs) || durationMs < 0 || durationMs > 7 * DAY))) {
     return json(res, 400, { ok: false });
   }
@@ -1126,13 +1199,15 @@ async function handlePause(req, res) {
     const previous = pauses.get(id);
     pauses.delete(id);
     if (!savePauses() && previous) pauses.set(id, previous);
-    sessions.delete(key);
     log('conversation_resumed', { channel, conversation: idempotencyKey(key) });
-  } else {
+  } else if (action === 'pause') {
     pause(key, durationMs);
   }
   if (!pauseStorageHealthy) return json(res, 503, { ok: false, error: 'pause_storage_error' });
-  return json(res, 200, { ok: true, paused: isPaused(key) });
+  const paused = isPaused(key);
+  const until = paused ? pauses.get(pauseKey(key)) : undefined;
+  return json(res, 200, { ok: true, paused, indefinite: until === Infinity,
+    until: Number.isFinite(until) ? new Date(until).toISOString() : null });
 }
 
 // Expire in-memory identifiers and sessions even when a contact never returns.
@@ -1147,7 +1222,9 @@ setInterval(() => {
     while (queue[0]?.expires <= now) queue.shift();
     if (!queue.length) waitingNotifications.delete(key);
   }
-  for (const [key, session] of sessions) if (session.until <= now) sessions.delete(key);
+  if (!sessionStatePath) {
+    for (const [key, session] of sessions) if (session.until <= now) sessions.delete(key);
+  }
 }, 60000).unref();
 
 export const server = createServer(async (req, res) => {
@@ -1170,6 +1247,8 @@ export const server = createServer(async (req, res) => {
           ffmpeg: !!ffmpeg,
           pauseAdmin: !!env.CONVERSATION_ADMIN_TOKEN,
           pausePersistence: !!pauseFile && pauseStorageHealthy,
+          sessionPersistence: !!sessionStatePath && sessionStorageHealthy,
+          instagramTestDiagnostic: instagramDiagnosticActive(),
         },
         provider: PROVIDER,
         testOnly: !ALLOW_ALL,

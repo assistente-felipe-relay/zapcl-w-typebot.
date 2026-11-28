@@ -53,10 +53,14 @@ export function typebotControls(bubbles, required) {
   let control;
   let issue;
   let controlCount = 0;
+  let silence = false;
   for (const bubble of bubbles) {
     const line = bubble.trim();
     if (!line) continue;
-    if (line === '[[SEM_RESPOSTA]]') return { messages: [], reason: 'intentional_silence' };
+    if (line === '[[SEM_RESPOSTA]]') {
+      silence = true;
+      continue;
+    }
     if (line.startsWith(marker)) {
       controlCount++;
       const parsed = parseControl(line.slice(marker.length).trim());
@@ -65,9 +69,7 @@ export function typebotControls(bubbles, required) {
         continue;
       }
       control = parsed.control;
-      if (['personal', 'no_reply'].includes(control.category) || control.action === 'ignore') {
-        return { messages: [], control, reason: 'intentional_silence' };
-      }
+      if (['personal', 'no_reply'].includes(control.category) || control.action === 'ignore') silence = true;
       if (!parsed.publicReply) continue;
       if (isPublicText(parsed.publicReply)) messages.push(parsed.publicReply);
       else issue = 'unsafe_public_text';
@@ -78,6 +80,7 @@ export function typebotControls(bubbles, required) {
     }
   }
   if (controlCount > 1) issue = 'duplicate_control';
+  if (!issue && silence) return { messages, control, reason: 'typebot_silence_recovered' };
   if (!issue && required && !control) issue = 'missing_control';
   // Malformed or ambiguous output cannot trigger routing or a pause. Independently safe
   // text may still be used when an attempted control failed validation.

@@ -17,23 +17,25 @@ const admin = 'fake-admin-secret';
 test('Typebot preserva texto seguro e distingue controle inválido de silêncio', () => {
   assert.deepEqual(typebotControls(['[Veja](https://example.com)'], false).messages, ['[Veja](https://example.com)']);
   assert.deepEqual(typebotControls(['Olá'], true).messages, []);
-  assert.deepEqual(typebotControls(['Olá', '[[SEM_RESPOSTA]]'], false).messages, []);
+  assert.deepEqual(typebotControls(['Olá', '[[SEM_RESPOSTA]]'], false).messages, ['Olá']);
   assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]invalid'], false), { messages: ['Olá'], reason: 'invalid_control' });
-  assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]{"action":"reply","category":"personal"}'], true).messages, []);
+  assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]{"action":"reply","category":"personal"}'], true).messages, ['Olá']);
   assert.deepEqual(typebotControls(['Olá', replyControl], true).messages, ['Olá']);
   assert.deepEqual(typebotControls(['Olá', '[[RELAY_V1]]{"action":"handoff","category":"support","route":"support","items":[{}]}'], true), { messages: ['Olá'], reason: 'invalid_control' });
   assert.deepEqual(typebotControls([replyControl + '\nComo posso ajudar?'], true).messages, ['Como posso ajudar?']);
   assert.equal(typebotControls([replyControl, replyControl], true).reason, 'duplicate_control');
   assert.equal(typebotControls(['Olá', '{"decision":{"action":"reply"}}'], true).reason, 'unsafe_public_text');
-  assert.equal(typebotControls(['Olá', '[[RELAY_V1]]{"action":"ignore","category":"no_reply"}'], true).reason, 'intentional_silence');
+  assert.equal(typebotControls(['Olá', '[[RELAY_V1]]{"action":"ignore","category":"no_reply"}'], true).reason, 'typebot_silence_recovered');
 });
 
 test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicatas e pausa', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'relay-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const pauseFile = join(directory, 'pauses.json');
+  const sessionFile = join(directory, 'sessions.json');
   Object.assign(process.env, {
-    PAUSE_STATE_PATH: pauseFile, ALLOW_ALL_CONTACTS: 'false', INSTAGRAM_ALLOW_ALL_CONTACTS: 'false',
+    PAUSE_STATE_PATH: pauseFile, SESSION_STATE_PATH: sessionFile,
+    INSTAGRAM_TEST_DIAGNOSTIC_USERNAME: '@nutridayane.silva', ALLOW_ALL_CONTACTS: 'false', INSTAGRAM_ALLOW_ALL_CONTACTS: 'false',
     WHATSAPP_PROVIDER: 'meta', TYPEBOT_REQUIRE_CONTROL: 'false',
     PORT: '0', DEBOUNCE_MS: '5000', SEND_DELAY_MS: '0', TEST_PHONE: user,
     META_ACCESS_TOKEN: 'fake-wa', META_APP_SECRET: secret, META_VERIFY_TOKEN: 'verification',
@@ -43,6 +45,10 @@ test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicata
     HANDOFF_TEST_TO: '5521999000002', NOTIFICATION_DRY_RUN: 'true',
   });
   const calls = [];
+  const logs = [];
+  const logger = console.log;
+  console.log = line => { logs.push(JSON.parse(line)); logger(line); };
+  t.after(() => { console.log = logger; });
   const localFetch = globalThis.fetch;
   let releaseTranscription;
   const transcription = new Promise(resolve => { releaseTranscription = resolve; });
@@ -62,6 +68,9 @@ test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicata
     if (href.endsWith('/v1/responses')) return Response.json({
       output: [{ content: [{ type: 'output_text', text: 'Print de treino com dois exercícios.' }] }],
     });
+    if (href.includes('graph.instagram.com') && href.endsWith('?fields=username')) {
+      return Response.json({ username: href.includes('/7777?') ? 'nutridayane.silva' : 'outro.perfil' });
+    }
     if (href.includes('graph.instagram.com') && href.includes('?fields=')) return Response.json({ name: 'Teste', username: 'tester' });
     if (href.includes('graph.instagram.com')) return Response.json({ message_id: 'ig-bot-1' });
     if (href.includes('graph.facebook.com')) return Response.json({ messages: [{ id: 'wa-bot-1' }] });
@@ -87,7 +96,7 @@ test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicata
     server.close();
   });
   if (!server.listening) await once(server, 'listening');
-  const base = 'http://127.0.0.1:' + server.address().port;
+  let base = 'http://127.0.0.1:' + server.address().port;
 
   function post(path, payload, credentials = {}) {
     const body = JSON.stringify(payload);
@@ -120,11 +129,22 @@ test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicata
   const health = await localFetch(base + '/').then(res => res.json());
   assert.equal(health.integrations.instagram, true);
   assert.equal(health.integrations.pausePersistence, true);
+  assert.equal(health.integrations.sessionPersistence, true);
+  assert.equal(health.integrations.instagramTestDiagnostic, true);
   assert.equal((await localFetch(base + '/webhook/instagram?hub.mode=subscribe&hub.verify_token=verification&hub.challenge=123')).status, 200);
   assert.equal((await post('/webhook/meta', wa([]), { 'x-hub-signature-256': 'invalid' })).status, 401);
   assert.equal((await post('/admin/conversation', {}, { 'x-relay-token': 'wrong' })).status, 401);
   assert.equal((await post('/handoff', { kind: 'support', requestId: 'test', name: 'Teste', phone: user, confirmed: true },
     { 'x-relay-token': 'fake-handoff' }).then(res => res.json())).dryRun, true);
+  await post('/webhook/instagram', ig([igMessage('bad-probe', 'Diagnóstico Instagram V4', '6666')]));
+  await waitFor(() => calls.some(call => call.href.includes('/6666?fields=username')));
+  await post('/webhook/instagram', ig([igMessage('good-probe', 'Diagnóstico Instagram V4', '7777')]));
+  const verifiedSender = await waitFor(() => logs.find(event => event.event === 'instagram_test_sender_verified'));
+  assert.equal(verifiedSender.senderId, '7777');
+  assert.equal((await localFetch(base + '/').then(res => res.json())).integrations.instagramTestDiagnostic, false);
+  assert.ok(!JSON.stringify(logs).includes('Diagnóstico Instagram V4'));
+  assert.ok(!JSON.stringify(logs).includes('6666'));
+  await post('/webhook/instagram', ig([igMessage('dayane-still-filtered', 'Ainda fora da lista', '7777')]));
   const now = Math.floor(Date.now() / 1000);
   const audio = { id: 'audio', type: 'audio', from: user, timestamp: now, audio: { id: 'media-1' } };
   await post('/webhook/meta', wa([audio, waText('first', 'Primeiro texto', user, now - 1), audio, waText('blocked', 'Bloqueado', '5521999000099')]));
@@ -155,8 +175,12 @@ test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicata
   assert.match(state[0][0], /^[a-f0-9]{64}$/);
   assert.ok(state[0][1] > Date.now());
   await post('/webhook/instagram', ig([igMessage('paused', 'Ignorar durante pausa')]));
+  assert.equal((await post('/admin/conversation', { channel: 'instagram', contact: user, action: 'status' },
+    { 'x-relay-token': admin }).then(res => res.json())).paused, true);
+  const previousSessions = await readFile(sessionFile, 'utf8');
   assert.equal((await post('/admin/conversation', { channel: 'instagram', contact: user, action: 'resume' },
     { 'x-relay-token': admin }).then(res => res.json())).paused, false);
+  assert.equal(await readFile(sessionFile, 'utf8'), previousSessions);
   await post('/webhook/instagram', ig([igMessage('resumed', 'Encaminhar duas demandas')]));
   const old = igMessage('expired', 'Janela expirada', '3333');
   old.timestamp -= 86401000;
@@ -165,5 +189,16 @@ test('webhooks simulados preservam WhatsApp e isolam sessões, mídia, duplicata
     call.body?.message?.text === 'Resposta de encaminhamento'));
   assert.equal(calls.some(call => call.body?.to === '5521999000002'), false);
   assert.deepEqual(JSON.parse(await readFile(pauseFile, 'utf8')), []);
-  assert.equal(calls.some(call => /Bloqueado|Ignorado|durante pausa|Janela expirada/.test(call.body?.message?.text || '')), false);
+  assert.equal(calls.some(call => /Bloqueado|Ignorado|durante pausa|Janela expirada|Ainda fora da lista/.test(call.body?.message?.text || '')), false);
+  await waitFor(() => logs.find(event => event.event === 'conversation_outcome' && event.reason === 'window_expired'));
+  server.closeAllConnections();
+  await new Promise(resolve => server.close(resolve));
+  const { server: restarted } = await import('../relay.mjs?session-restart');
+  t.after(() => restarted.close());
+  if (!restarted.listening) await once(restarted, 'listening');
+  base = 'http://127.0.0.1:' + restarted.address().port;
+  await post('/webhook/meta', wa([waText('after-restart', 'Retomada depois de reiniciar')]));
+  const restored = await waitFor(() => calls.find(call => call.body?.message?.text === 'Retomada depois de reiniciar'));
+  assert.match(restored.href, /sessions\/session-wa\/continueChat$/);
+
 });

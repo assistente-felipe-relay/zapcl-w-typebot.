@@ -21,9 +21,10 @@ async function setup(t, notifyEnabled = false, dryRun = true) {
     ALLOW_ALL_CONTACTS: 'false', HANDOFF_ENABLED: String(notifyEnabled),
     NOTIFICATION_DRY_RUN: String(dryRun), WHATSAPP_PROVIDER: 'meta',
     TYPEBOT_REQUIRE_CONTROL: 'true', TYPEBOT_API: 'https://typebot.invalid/api',
-    PORT: '0', DEBOUNCE_MS: '5000', SEND_DELAY_MS: '0', TEST_PHONE: phone,
+    PORT: '0', DEBOUNCE_MS: '', SEND_DELAY_MS: '0', TEST_PHONE: phone,
     META_ACCESS_TOKEN: 'mock-meta', META_APP_SECRET: signatureSecret, META_PHONE_NUMBER_ID: '99',
-    HANDOFF_TEST_TO: destination, WHATSAPP_FROM: business, PAUSE_STATE_PATH: '',
+    HANDOFF_TEST_TO: destination, WHATSAPP_FROM: business, PAUSE_STATE_PATH: '', SESSION_STATE_PATH: '',
+    COMMERCIAL_HANDOFF_PHONE: notifyEnabled ? destination : phone,
   });
   const transport = globalThis.fetch;
   const logger = console.log;
@@ -78,7 +79,7 @@ async function setup(t, notifyEnabled = false, dryRun = true) {
   }
   async function outcomeAfter(logOffset) {
     await setImmediate();
-    t.mock.timers.tick(5001);
+    t.mock.timers.tick(20001);
     for (let attempt = 0; attempt < 300; attempt++) {
       const outcome = logs.slice(logOffset).find(log => log.event === 'conversation_outcome');
       if (outcome) {
@@ -93,7 +94,7 @@ async function setup(t, notifyEnabled = false, dryRun = true) {
   return { message, outcomeAfter, logs, wa, typebot, setModel: fn => { model = fn; }, setSend: fn => { send = fn; } };
 }
 
-test('35 turnos comerciais preservam a sessão e recuperam falhas no relay', async t => {
+test('55 turnos comerciais preservam a sessão e recuperam falhas no relay', async t => {
   const f = await setup(t);
   const turns = new Map([
     [3, { input: 'O valor está acima do meu orçamento.', output: [reply, 'Qual faixa cabe no seu orçamento?'] }],
@@ -103,7 +104,7 @@ test('35 turnos comerciais preservam a sessão e recuperam falhas no relay', asy
     [9, { output: [handoff, 'Encaminhei o pedido. Quais horários são melhores?'], reason: 'handoff_status_filtered', status: 'disabled', sendCount: 2, expected: 'Quais horários são melhores?' }],
     [10, { output: ['[[RELAY_V1]]inválido', 'Você prefere pela manhã?'], reason: 'invalid_control', expected: 'Você prefere pela manhã?' }],
     [11, { output: ['[[RELAY_V1]]inválido'], reason: 'invalid_control', expected: 'Pode reenviar' }],
-    [12, { output: [decision('personal', 'ignore'), 'Texto suprimido'], silent: 'intentional_silence' }],
+    [12, { output: [decision('personal', 'ignore'), 'Posso conversar sobre isso com você.'], reason: 'typebot_silence_recovered', expected: 'Posso conversar' }],
     [13, { output: [reply], reason: 'empty_public_reply', expected: 'Pode reenviar' }],
     [14, { output: [handoff], reason: 'handoff', status: 'disabled', expected: 'não consegui concluir' }],
     [15, { output: [reply + '\nPodemos avaliar opções.'], expected: 'Podemos avaliar opções.' }],
@@ -112,14 +113,17 @@ test('35 turnos comerciais preservam a sessão e recuperam falhas no relay', asy
     [18, { output: [reply, 'Pagamento confirmado. Qual sua disponibilidade?'], reason: 'unverified_action_filtered', expected: 'Qual sua disponibilidade?' }],
     [19, { output: new Response(null, { status: 503 }), reason: 'typebot_failed', expected: 'Pode reenviar' }],
     [20, { timeout: true, reason: 'typebot_failed', expected: 'Pode reenviar' }],
-    [21, { output: [decision('no_reply', 'ignore')], silent: 'intentional_silence' }],
+    [21, { output: [decision('no_reply', 'ignore')], reason: 'typebot_silence_recovered', expected: 'Pode reenviar' }],
     [22, { output: ['{"decision":{"category":"lead"},"publicReply":"texto interno"}'], reason: 'unsafe_public_text', expected: 'Pode reenviar' }],
     [23, { output: ['Resposta sem controle'], reason: 'missing_control', expected: 'Pode reenviar' }],
     [24, { fragments: ['O plano é mensal?', 'E o valor no Pix?'] }],
     [25, { invalidSession: true }],
     [26, { sendFailure: true, silent: 'send_failed' }],
     [28, { fragments: ['Prefiro adiar.', 'Quais condições ficam disponíveis?'] }],
-    [31, { output: [decision('lead', 'ignore')], silent: 'intentional_silence' }],
+    [31, { output: [decision('lead', 'ignore')], reason: 'typebot_silence_recovered', expected: 'Pode reenviar' }],
+    [32, { output: [decision('human', 'pause'), 'Posso esclarecer essa dúvida por aqui.'], reason: 'typebot_pause_recovered', expected: 'Posso esclarecer' }],
+    [41, { output: ['[[SEM_RESPOSTA]]'], reason: 'typebot_silence_recovered', expected: 'Pode reenviar' }],
+    [49, { output: [decision('human', 'pause')], reason: 'typebot_pause_recovered', expected: 'Pode reenviar' }],
   ]);
   let current;
   f.setModel(({ operation }) => {
@@ -130,7 +134,7 @@ test('35 turnos comerciais preservam a sessão e recuperam falhas no relay', asy
   f.setSend(() => current.sendFailure ? new Response(null, { status: 503 }) :
     Response.json({ messages: [{ id: String(f.wa.length) }] }));
 
-  for (let turn = 1; turn <= 35; turn++) {
+  for (let turn = 1; turn <= 55; turn++) {
     current = turns.get(turn) || {};
     const offset = f.logs.length;
     const sends = f.wa.length;
@@ -138,9 +142,9 @@ test('35 turnos comerciais preservam a sessão e recuperam falhas no relay', asy
     const text = current.input || 'Solicitação comercial ' + turn;
     if (current.fragments) {
       await f.message(current.fragments[0]);
-      t.mock.timers.tick(3000);
+      t.mock.timers.tick(13000);
       await f.message(current.fragments[1]);
-      t.mock.timers.tick(2500);
+      t.mock.timers.tick(8000);
       assert.equal(f.typebot.length, calls, 'a última mensagem reinicia o debounce');
     } else {
       await f.message(text);
